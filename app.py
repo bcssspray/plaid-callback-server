@@ -1,7 +1,12 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import os
+import json
 
 app = Flask(__name__)
+
+# In-memory stores
+latest_token = {"link_token": None}
+pending_tokens = {}  # item_id -> public_token
 
 @app.route('/callback')
 def callback():
@@ -28,74 +33,100 @@ def callback():
   <p>Please wait.</p>
 </div>
 <script>
-var params = new URLSearchParams(window.location.search);
-var oauthStateId = params.get('oauth_state_id');
-
-if (!oauthStateId) {
-  document.getElementById('root').innerHTML =
-    '<h2 style="color:#f87171">Missing oauth_state_id</h2>' +
-    '<p>Please restart link_accounts.py and try again.</p>';
-} else {
-  fetch('/get_token?oauth_state_id=' + oauthStateId)
-    .then(r => r.json())
-    .then(data => {
-      if (!data.link_token) {
+fetch('/get_token')
+  .then(r => r.json())
+  .then(data => {
+    if (!data.link_token) {
+      document.getElementById('root').innerHTML =
+        '<h2 style="color:#f87171">No link token found</h2>' +
+        '<p>Please restart link_accounts.py and try again.</p>';
+      return;
+    }
+    var handler = Plaid.create({
+      token: data.link_token,
+      receivedRedirectUri: window.location.href,
+      onSuccess: function(public_token, metadata) {
+        var inst = metadata.institution ? metadata.institution.name : 'Unknown Bank';
         document.getElementById('root').innerHTML =
-          '<h2 style="color:#f87171">No link token found</h2>' +
-          '<p>Please restart link_accounts.py and try again.</p>';
-        return;
+          '<h2 style="color:#4ade80">✅ ' + inst + ' authenticated!</h2>' +
+          '<p>Copy the token below and paste it into Terminal when prompted.</p>' +
+          '<div class="token-box">' +
+            '<div class="label">Institution: ' + inst + '</div>' +
+            '<div>' + public_token + '</div>' +
+          '</div>' +
+          '<p style="margin-top:1rem;font-size:13px;">After pasting in Terminal, you can close this tab.</p>';
+      },
+      onExit: function(err) {
+        document.getElementById('root').innerHTML =
+          '<h2 style="color:' + (err ? '#f87171' : '#888') + '">' +
+          (err ? '❌ Error' : 'Cancelled') + '</h2>' +
+          '<p>' + (err ? (err.display_message || JSON.stringify(err)) : 'Close this tab and try again.') + '</p>';
       }
-      var handler = Plaid.create({
-        token: data.link_token,
-        receivedRedirectUri: window.location.href,
-        onSuccess: function(public_token, metadata) {
-          var inst = metadata.institution ? metadata.institution.name : 'Unknown Bank';
-          document.getElementById('root').innerHTML =
-            '<h2 style="color:#4ade80">✅ ' + inst + ' authenticated!</h2>' +
-            '<p>Copy the token below and paste it into Terminal when prompted.</p>' +
-            '<div class="token-box">' +
-              '<div class="label">Institution: ' + inst + '</div>' +
-              '<div>' + public_token + '</div>' +
-            '</div>' +
-            '<p style="margin-top:1rem;font-size:13px;">After pasting in Terminal, you can close this tab.</p>';
-        },
-        onExit: function(err) {
-          document.getElementById('root').innerHTML =
-            '<h2 style="color:' + (err ? '#f87171' : '#888') + '">' +
-            (err ? '❌ Error' : 'Cancelled') + '</h2>' +
-            '<p>' + (err ? (err.display_message || JSON.stringify(err)) : 'Close this tab and try again.') + '</p>';
-        }
-      });
-      handler.open();
     });
-}
+    handler.open();
+  });
 </script>
 </body>
 </html>"""
     return html
 
 
-# In-memory store for link tokens keyed by oauth_state_id
-token_store = {}
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    webhook_type = data.get('webhook_type')
+    webhook_code = data.get('webhook_code')
+    
+    print(f"Webhook received: {webhook_type}/{webhook_code}")
+    print(json.dumps(data, indent=2))
+
+    # Handle OAuth completion webhook
+    if webhook_type == 'ITEM' and webhook_code == 'PENDING_EXPIRATION':
+        pass
+    elif webhook_type == 'LINK' and webhook_code == 'SESSION_FINISHED':
+        public_token = data.get('public_token')
+        item_id = data.get('item_id', 'latest')
+        institution = data.get('institution', {}).get('name', 'Unknown')
+        if public_token:
+            pending_tokens[item_id] = {
+                'public_token': public_token,
+                'institution': institution
+            }
+            print(f"Stored public_token for {institution}")
+
+    return jsonify({'status': 'ok'})
+
 
 @app.route('/store_token')
 def store_token():
-    oauth_state_id = request.args.get('oauth_state_id')
     link_token = request.args.get('link_token')
-    if oauth_state_id and link_token:
-        token_store[oauth_state_id] = link_token
-        return {'status': 'ok'}
-    return {'status': 'error'}, 400
+    if link_token:
+        latest_token["link_token"] = link_token
+        return jsonify({'status': 'ok'})
+    return jsonify({'status': 'error'}), 400
+
 
 @app.route('/get_token')
 def get_token():
-    oauth_state_id = request.args.get('oauth_state_id')
-    link_token = token_store.get(oauth_state_id)
-    return {'link_token': link_token}
+    return jsonify({'link_token': latest_token.get("link_token")})
+
+
+@app.route('/get_pending')
+def get_pending():
+    """Poll this to check if a public_token arrived via webhook."""
+    return jsonify(pending_tokens)
+
+
+@app.route('/clear_pending')
+def clear_pending():
+    pending_tokens.clear()
+    return jsonify({'status': 'ok'})
+
 
 @app.route('/health')
 def health():
-    return {'status': 'ok'}
+    return jsonify({'status': 'ok'})
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
